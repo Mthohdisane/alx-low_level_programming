@@ -3,7 +3,7 @@
 /**
  * main - use printf fuction to print a string
  *
- *Discription: it should compile without warning when using the -Wall gcc optio * n!
+ *Discription: compile without warning when using the -Wall gcc option!
  * Return: 0
  */
 
