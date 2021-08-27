@@ -4,7 +4,7 @@
  * main - print the letters of the alphabet in reverse
  *
  *
- * Return 0
+ * Return: 0
  */
 
 int main(void)

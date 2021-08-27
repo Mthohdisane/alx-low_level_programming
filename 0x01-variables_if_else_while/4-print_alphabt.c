@@ -1,3 +1,4 @@
+
 #include <stdio.h>
 
 /**
@@ -5,7 +6,7 @@
  *
  * print the letters of the alphabet except e, q
  *
- * Return 0
+ * Return: 0
  */
 
 int main(void)

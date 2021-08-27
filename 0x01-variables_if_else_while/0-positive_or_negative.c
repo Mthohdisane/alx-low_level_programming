@@ -2,7 +2,13 @@
 #include <stdlib.h>
 #include <time.h>
 
-/* betty style main function */
+/**
+ * main - determine if number is positive or negative
+ *
+ *
+ * Return: 0
+ */
+
 int main(void)
 {
 	int n;

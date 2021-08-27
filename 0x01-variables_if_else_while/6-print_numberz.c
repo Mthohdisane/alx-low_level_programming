@@ -1,10 +1,9 @@
 #include <stdio.h>
 
 /**
- * main - print single digit numbers
- 
+ * main - print single digit numbers 
  *
- * Return 0
+ * Return: 0
  */
 
 int main(void)
