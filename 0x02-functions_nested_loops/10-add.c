@@ -5,6 +5,10 @@
  *
  * Description: give two integers, return sum
  *
+ * @n1: add to n2
+ *
+ * @n2: add to n1
+ * 
  * Return: sum
  */
 

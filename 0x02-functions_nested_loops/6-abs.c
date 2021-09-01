@@ -3,6 +3,8 @@
 /**
  * _abs - computes the absolute value of an integer
  *
+ *@n: an integer
+ *
  * Return: value of last digit
  */
 
