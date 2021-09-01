@@ -4,7 +4,7 @@
  * print_times_table - print the times table
  *
  * @n: diagnos the value of n
- * 
+ *
  * Return: void
  */
 
