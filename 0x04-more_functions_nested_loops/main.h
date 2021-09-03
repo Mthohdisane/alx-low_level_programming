@@ -34,5 +34,6 @@ void print_triangle(int size);
 /* 101-print_number.c */
 void print_number(int n);
 
+int _putchar(char c);
 
 #endif
