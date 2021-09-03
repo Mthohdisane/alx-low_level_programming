@@ -4,7 +4,7 @@
  * print_line - prints a line of _ n long
  * @n: length of line
  *
- * Return: void
+ * Return: Always 0
  */
 
 void print_line(int n)
