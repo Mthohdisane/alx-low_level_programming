@@ -1,19 +1,29 @@
 #include "main.h"
+#include <stdio.h>
 
 /**
- * main - check the code for Holberton School students.
- *
- * Return: Always 0.
+ * print_array - prints n elements of an array
+ * @a: array of integers
+ * @n: number of items to print
+ * Return: void
  */
-int main(void)
-{
-	int array[5];
 
-	array[0] = 98;
-	array[1] = 402;
-	array[2] = -198;
-	array[3] = 298;
-	array[4] = -1024;
-	print_array(array, 5);
-	return (0);
+void print_array(int *a, int n)
+{
+	int i, count;
+
+	i = 0;
+	count = 1;
+	if (n < 0)
+		n = 0;
+	if (n > 0)
+	{
+		while (a[i] != '\0' && count < n)
+		{
+			printf("%d, ", a[i]);
+			i++;
+			count++;
+		}
+		printf("%d\n", a[i]);
+	}
 }
