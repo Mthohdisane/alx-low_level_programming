@@ -2,7 +2,7 @@
 
 /**
  * free_listint_safe - frees a list (safe version)
- * @h: linked list of type listint_t
+ * @head: linked list of type listint_t
  *
  * Return: number of nodes in freed list
  */
