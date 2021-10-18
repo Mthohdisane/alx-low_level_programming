@@ -1,1001 +1,302 @@
-/* elf header parsing */
-/* SPDX-License-Identifier: GPL-2.0-only */
-
+#include <elf.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
+#include <unistd.h>
 
-#include "elfparsing.h"
-#include "common.h"
-#include "cbfs.h"
-
-/*
- * Short form: this is complicated, but we've tried making it simple
- * and we keep hitting problems with our ELF parsing.
+/**
+ * _strncmp - compare two strings
+ * @s1: the first string
+ * @s2: the second string
+ * @n: the max number of bytes to compare
  *
- * The ELF parsing situation has always been a bit tricky.  In fact,
- * we (and most others) have been getting it wrong in small ways for
- * years. Recently this has caused real trouble for the ARM V8 build.
- * In this file we attempt to finally get it right for all variations
- * of endian-ness and word size and target architectures and
- * architectures we might get run on. Phew!. To do this we borrow a
- * page from the FreeBSD NFS xdr model (see elf_ehdr and elf_phdr),
- * the Plan 9 endianness functions (see xdr.c), and Go interfaces (see
- * how we use buffer structs in this file). This ends up being a bit
- * wordy at the lowest level, but greatly simplifies the elf parsing
- * code and removes a common source of bugs, namely, forgetting to
- * flip type endianness when referencing a struct member.
- *
- * ELF files can have four combinations of data layout: 32/64, and
- * big/little endian.  Further, to add to the fun, depending on the
- * word size, the size of the ELF structs varies. The coreboot SELF
- * format is simpler in theory: it's supposed to be always BE, and the
- * various struct members allow room for growth: the entry point is
- * always 64 bits, for example, so the size of a SELF struct is
- * constant, regardless of target architecture word size.  Hence, we
- * need to do some transformation of the ELF files.
- *
- * A given architecture, realistically, only supports one of the four
- * combinations at a time as the 'native' format. Hence, our code has
- * been sprinkled with every variation of [nh]to[hn][sll] over the
- * years. We've never quite gotten it all right, however, and a quick
- * pass over this code revealed another bug.  It's all worked because,
- * until now, all the working platforms that had CBFS were 32 LE. Even then,
- * however, bugs crept in: we recently realized that we're not
- * transforming the entry point to big format when we store into the
- * SELF image.
- *
- * The problem is essentially an XDR operation:
- * we have something in a foreign format and need to transform it.
- * It's most like XDR because:
- * 1) the byte order can be wrong
- * 2) the word size can be wrong
- * 3) the size of elements in the stream depends on the value
- *    of other elements in the stream
- * it's not like XDR because:
- * 1) the byte order can be right
- * 2) the word size can be right
- * 3) the struct members are all on a natural alignment
- *
- * Hence, this new approach.  To cover word size issues, we *always*
- * transform the two structs we care about, the file header and
- * program header, into a native struct in the 64 bit format:
- *
- * [32,little] -> [Elf64_Ehdr, Elf64_Phdr]
- * [64,little] -> [Elf64_Ehdr, Elf64_Phdr]
- * [32,big] -> [Elf64_Ehdr, Elf64_Phdr]
- * [64,big] -> [Elf64_Ehdr, Elf64_Phdr]
- * Then we just use those structs, and all the need for inline ntoh* goes away,
- * as well as all the chances for error.
- * This works because all the SELF structs have fields large enough for
- * the largest ELF 64 struct members, and all the Elf64 struct members
- * are at least large enough for all ELF 32 struct members.
- * We end up with one function to do all our ELF parsing, and two functions
- * to transform the headers. For the put case, we also have
- * XDR functions, and hopefully we'll never again spend 5 years with the
- * wrong endian-ness on an output value :-)
- * This should work for all word sizes and endianness we hope to target.
- * I *really* don't want to be here for 128 bit addresses.
- *
- * The parse functions are called with a pointer to an input buffer
- * struct. One might ask: are there enough bytes in the input buffer?
- * We know there need to be at *least* sizeof(Elf32_Ehdr) +
- * sizeof(Elf32_Phdr) bytes. Realistically, there has to be some data
- * too.  If we start to worry, though we have not in the past, we
- * might apply the simple test: the input buffer needs to be at least
- * sizeof(Elf64_Ehdr) + sizeof(Elf64_Phdr) bytes because, even if it's
- * ELF 32, there's got to be *some* data! This is not theoretically
- * accurate but it is actually good enough in practice. It allows the
- * header transformation code to ignore the possibility of underrun.
- *
- * We also must accommodate different ELF files, and hence formats,
- * in the same cbfs invocation. We might load a 64-bit payload
- * on a 32-bit machine; we might even have a mixed armv7/armv8
- * SOC or even a system with an x86/ARM!
- *
- * A possibly problematic (though unlikely to be so) assumption
- * is that we expect the BIOS to remain in the lowest 32 bits
- * of the physical address space. Since ARMV8 has standardized
- * on that, and x86_64 also has, this seems a safe assumption.
- *
- * To repeat, ELF structs are different sizes because ELF struct
- * members are different sizes, depending on values in the ELF file
- * header. For this we use the functions defined in xdr.c, which
- * consume bytes, convert the endianness, and advance the data pointer
- * in the buffer struct.
+ * Return: 0 if the first n bytes of s1 and s2 are equal, otherwise non-zero
  */
-
-
-static int iself(const void *input)
+int _strncmp(const char *s1, const char *s2, size_t n)
 {
-	const Elf32_Ehdr *ehdr = input;
-	return !memcmp(ehdr->e_ident, ELFMAG, 4);
+	for ( ; n && *s1 && *s2; --n, ++s1, ++s2)
+	{
+		if (*s1 != *s2)
+			return (*s1 - *s2);
+	}
+	if (n)
+	{
+		if (*s1)
+			return (1);
+		if (*s2)
+			return (-1);
+	}
+	return (0);
 }
 
-/* Get the ident array, so we can figure out
- * endian-ness, word size, and in future other useful
- * parameters
+/**
+ * _close - close a file descriptor and print an error message upon failure
+ * @fd: the file descriptor to close
  */
-static void
-elf_eident(struct buffer *input, Elf64_Ehdr *ehdr)
+void _close(int fd)
 {
-	bgets(input, ehdr->e_ident, sizeof(ehdr->e_ident));
-}
-
-
-static int
-check_size(const struct buffer *b, size_t offset, size_t size, const char *desc)
-{
-	if (size == 0)
-		return 0;
-
-	if (offset >= buffer_size(b) || (offset + size) > buffer_size(b)) {
-		ERROR("The file is not large enough for the '%s'. "
-		      "%zu bytes @ offset %zu, input %zu bytes.\n",
-		      desc, size, offset, buffer_size(b));
-		return -1;
-	}
-	return 0;
-}
-
-static void
-elf_ehdr(struct buffer *input, Elf64_Ehdr *ehdr, struct xdr *xdr, int bit64)
-{
-	ehdr->e_type = xdr->get16(input);
-	ehdr->e_machine = xdr->get16(input);
-	ehdr->e_version = xdr->get32(input);
-	if (bit64){
-		ehdr->e_entry = xdr->get64(input);
-		ehdr->e_phoff = xdr->get64(input);
-		ehdr->e_shoff = xdr->get64(input);
-	} else {
-		ehdr->e_entry = xdr->get32(input);
-		ehdr->e_phoff = xdr->get32(input);
-		ehdr->e_shoff = xdr->get32(input);
-	}
-	ehdr->e_flags = xdr->get32(input);
-	ehdr->e_ehsize = xdr->get16(input);
-	ehdr->e_phentsize = xdr->get16(input);
-	ehdr->e_phnum = xdr->get16(input);
-	ehdr->e_shentsize = xdr->get16(input);
-	ehdr->e_shnum = xdr->get16(input);
-	ehdr->e_shstrndx = xdr->get16(input);
-}
-
-static void
-elf_phdr(struct buffer *pinput, Elf64_Phdr *phdr,
-	 int entsize, struct xdr *xdr, int bit64)
-{
-	/*
-	 * The entsize need not be sizeof(*phdr).
-	 * Hence, it is easier to keep a copy of the input,
-	 * as the xdr functions may not advance the input
-	 * pointer the full entsize; rather than get tricky
-	 * we just advance it below.
-	 */
-	struct buffer input;
-	buffer_clone(&input, pinput);
-	if (bit64){
-		phdr->p_type = xdr->get32(&input);
-		phdr->p_flags = xdr->get32(&input);
-		phdr->p_offset = xdr->get64(&input);
-		phdr->p_vaddr = xdr->get64(&input);
-		phdr->p_paddr = xdr->get64(&input);
-		phdr->p_filesz = xdr->get64(&input);
-		phdr->p_memsz = xdr->get64(&input);
-		phdr->p_align = xdr->get64(&input);
-	} else {
-		phdr->p_type = xdr->get32(&input);
-		phdr->p_offset = xdr->get32(&input);
-		phdr->p_vaddr = xdr->get32(&input);
-		phdr->p_paddr = xdr->get32(&input);
-		phdr->p_filesz = xdr->get32(&input);
-		phdr->p_memsz = xdr->get32(&input);
-		phdr->p_flags = xdr->get32(&input);
-		phdr->p_align = xdr->get32(&input);
-	}
-	buffer_seek(pinput, entsize);
-}
-
-static void
-elf_shdr(struct buffer *pinput, Elf64_Shdr *shdr,
-	 int entsize, struct xdr *xdr, int bit64)
-{
-	/*
-	 * The entsize need not be sizeof(*shdr).
-	 * Hence, it is easier to keep a copy of the input,
-	 * as the xdr functions may not advance the input
-	 * pointer the full entsize; rather than get tricky
-	 * we just advance it below.
-	 */
-	struct buffer input = *pinput;
-	if (bit64){
-		shdr->sh_name = xdr->get32(&input);
-		shdr->sh_type = xdr->get32(&input);
-		shdr->sh_flags = xdr->get64(&input);
-		shdr->sh_addr = xdr->get64(&input);
-		shdr->sh_offset = xdr->get64(&input);
-		shdr->sh_size= xdr->get64(&input);
-		shdr->sh_link = xdr->get32(&input);
-		shdr->sh_info = xdr->get32(&input);
-		shdr->sh_addralign = xdr->get64(&input);
-		shdr->sh_entsize = xdr->get64(&input);
-	} else {
-		shdr->sh_name = xdr->get32(&input);
-		shdr->sh_type = xdr->get32(&input);
-		shdr->sh_flags = xdr->get32(&input);
-		shdr->sh_addr = xdr->get32(&input);
-		shdr->sh_offset = xdr->get32(&input);
-		shdr->sh_size = xdr->get32(&input);
-		shdr->sh_link = xdr->get32(&input);
-		shdr->sh_info = xdr->get32(&input);
-		shdr->sh_addralign = xdr->get32(&input);
-		shdr->sh_entsize = xdr->get32(&input);
-	}
-	buffer_seek(pinput, entsize);
-}
-
-static int
-phdr_read(const struct buffer *in, struct parsed_elf *pelf,
-          struct xdr *xdr, int bit64)
-{
-	struct buffer b;
-	Elf64_Phdr *phdr;
-	Elf64_Ehdr *ehdr;
-	int i;
-
-	ehdr = &pelf->ehdr;
-	/* cons up an input buffer for the headers.
-	 * Note that the program headers can be anywhere,
-	 * per the ELF spec, You'd be surprised how many ELF
-	 * readers miss this little detail.
-	 */
-	buffer_splice(&b, in, ehdr->e_phoff,
-		      (uint32_t)ehdr->e_phentsize * ehdr->e_phnum);
-	if (check_size(in, ehdr->e_phoff, buffer_size(&b), "program headers"))
-		return -1;
-
-	/* gather up all the phdrs.
-	 * We do them all at once because there is more
-	 * than one loop over all the phdrs.
-	 */
-	phdr = calloc(ehdr->e_phnum, sizeof(*phdr));
-	for (i = 0; i < ehdr->e_phnum; i++) {
-		DEBUG("Parsing segment %d\n", i);
-		elf_phdr(&b, &phdr[i], ehdr->e_phentsize, xdr, bit64);
-
-		/* Ensure the contents are valid within the elf file. */
-		if (check_size(in, phdr[i].p_offset, phdr[i].p_filesz,
-	                  "segment contents")) {
-			free(phdr);
-			return -1;
-		}
-	}
-
-	pelf->phdr = phdr;
-
-	return 0;
-}
-
-static int
-shdr_read(const struct buffer *in, struct parsed_elf *pelf,
-          struct xdr *xdr, int bit64)
-{
-	struct buffer b;
-	Elf64_Shdr *shdr;
-	Elf64_Ehdr *ehdr;
-	int i;
-
-	ehdr = &pelf->ehdr;
-
-	/* cons up an input buffer for the section headers.
-	 * Note that the section headers can be anywhere,
-	 * per the ELF spec, You'd be surprised how many ELF
-	 * readers miss this little detail.
-	 */
-	buffer_splice(&b, in, ehdr->e_shoff,
-		      (uint32_t)ehdr->e_shentsize * ehdr->e_shnum);
-	if (check_size(in, ehdr->e_shoff, buffer_size(&b), "section headers"))
-		return -1;
-
-	/* gather up all the shdrs. */
-	shdr = calloc(ehdr->e_shnum, sizeof(*shdr));
-	for (i = 0; i < ehdr->e_shnum; i++) {
-		DEBUG("Parsing section %d\n", i);
-		elf_shdr(&b, &shdr[i], ehdr->e_shentsize, xdr, bit64);
-	}
-
-	pelf->shdr = shdr;
-
-	return 0;
-}
-
-static int
-reloc_read(const struct buffer *in, struct parsed_elf *pelf,
-           struct xdr *xdr, int bit64)
-{
-	struct buffer b;
-	Elf64_Word i;
-	Elf64_Ehdr *ehdr;
-
-	ehdr = &pelf->ehdr;
-	pelf->relocs = calloc(ehdr->e_shnum, sizeof(Elf64_Rela *));
-
-	/* Allocate array for each section that contains relocation entries. */
-	for (i = 0; i < ehdr->e_shnum; i++) {
-		Elf64_Shdr *shdr;
-		Elf64_Rela *rela;
-		Elf64_Xword j;
-		Elf64_Xword nrelocs;
-		int is_rela;
-
-		shdr = &pelf->shdr[i];
-
-		/* Only process REL and RELA sections. */
-		if (shdr->sh_type != SHT_REL && shdr->sh_type != SHT_RELA)
-			continue;
-
-		DEBUG("Checking relocation section %u\n", i);
-
-		/* Ensure the section that relocations apply is a valid. */
-		if (shdr->sh_info >= ehdr->e_shnum ||
-		    shdr->sh_info == SHN_UNDEF) {
-			ERROR("Relocations apply to an invalid section: %u\n",
-			      shdr[i].sh_info);
-			return -1;
-		}
-
-		is_rela = shdr->sh_type == SHT_RELA;
-
-		/* Determine the number relocations in this section. */
-		nrelocs = shdr->sh_size / shdr->sh_entsize;
-
-		pelf->relocs[i] = calloc(nrelocs, sizeof(Elf64_Rela));
-
-		buffer_splice(&b, in, shdr->sh_offset, shdr->sh_size);
-		if (check_size(in, shdr->sh_offset, buffer_size(&b),
-		               "relocation section")) {
-			ERROR("Relocation section %u failed.\n", i);
-			return -1;
-		}
-
-		rela = pelf->relocs[i];
-		for (j = 0; j < nrelocs; j++) {
-			if (bit64) {
-				rela->r_offset = xdr->get64(&b);
-				rela->r_info = xdr->get64(&b);
-				if (is_rela)
-					rela->r_addend = xdr->get64(&b);
-			} else {
-				uint32_t r_info;
-
-				rela->r_offset = xdr->get32(&b);
-				r_info = xdr->get32(&b);
-				rela->r_info = ELF64_R_INFO(ELF32_R_SYM(r_info),
-				                          ELF32_R_TYPE(r_info));
-				if (is_rela)
-					rela->r_addend = xdr->get32(&b);
-			}
-			rela++;
-		}
-	}
-
-	return 0;
-}
-
-static int strtab_read(const struct buffer *in, struct parsed_elf *pelf)
-{
-	Elf64_Ehdr *ehdr;
-	Elf64_Word i;
-
-	ehdr = &pelf->ehdr;
-
-	if (ehdr->e_shstrndx >= ehdr->e_shnum) {
-		ERROR("Section header string table index out of range: %d\n",
-		      ehdr->e_shstrndx);
-		return -1;
-	}
-
-	/* For each section of type SHT_STRTAB create a symtab buffer. */
-	pelf->strtabs = calloc(ehdr->e_shnum, sizeof(struct buffer *));
-
-	for (i = 0; i < ehdr->e_shnum; i++) {
-		struct buffer *b;
-		Elf64_Shdr *shdr = &pelf->shdr[i];
-
-		if (shdr->sh_type != SHT_STRTAB)
-			continue;
-
-		b = calloc(1, sizeof(*b));
-		buffer_splice(b, in, shdr->sh_offset, shdr->sh_size);
-		if (check_size(in, shdr->sh_offset, buffer_size(b), "strtab")) {
-			ERROR("STRTAB section not within bounds: %d\n", i);
-			free(b);
-			return -1;
-		}
-		pelf->strtabs[i] = b;
-	}
-
-	return 0;
-}
-
-static int
-symtab_read(const struct buffer *in, struct parsed_elf *pelf,
-            struct xdr *xdr, int bit64)
-{
-	Elf64_Ehdr *ehdr;
-	Elf64_Shdr *shdr;
-	Elf64_Half shnum;
-	Elf64_Xword i;
-	Elf64_Xword nsyms;
-	Elf64_Sym *sym;
-	struct buffer b;
-
-	ehdr = &pelf->ehdr;
-
-	shdr = NULL;
-	for (shnum = 0; shnum < ehdr->e_shnum; shnum++) {
-		if (pelf->shdr[shnum].sh_type != SHT_SYMTAB)
-			continue;
-
-		if (shdr != NULL) {
-			ERROR("Multiple symbol sections found. %u and %u\n",
-			      (unsigned int)(shdr - pelf->shdr), shnum);
-			return -1;
-		}
-
-		shdr = &pelf->shdr[shnum];
-	}
-
-	if (shdr == NULL) {
-		ERROR("No symbol table found.\n");
-		return -1;
-	}
-
-	buffer_splice(&b, in, shdr->sh_offset, shdr->sh_size);
-	if (check_size(in, shdr->sh_offset, buffer_size(&b), "symtab"))
-		return -1;
-
-	nsyms = shdr->sh_size / shdr->sh_entsize;
-
-	pelf->syms = calloc(nsyms, sizeof(Elf64_Sym));
-
-	for (i = 0; i < nsyms; i++) {
-		sym = &pelf->syms[i];
-
-		if (bit64) {
-			sym->st_name = xdr->get32(&b);
-			sym->st_info = xdr->get8(&b);
-			sym->st_other = xdr->get8(&b);
-			sym->st_shndx = xdr->get16(&b);
-			sym->st_value = xdr->get64(&b);
-			sym->st_size = xdr->get64(&b);
-		} else {
-			sym->st_name = xdr->get32(&b);
-			sym->st_value = xdr->get32(&b);
-			sym->st_size = xdr->get32(&b);
-			sym->st_info = xdr->get8(&b);
-			sym->st_other = xdr->get8(&b);
-			sym->st_shndx = xdr->get16(&b);
-		}
-	}
-
-	return 0;
-}
-
-int parse_elf(const struct buffer *pinput, struct parsed_elf *pelf, int flags)
-{
-	struct xdr *xdr = &xdr_le;
-	int bit64 = 0;
-	struct buffer input;
-	Elf64_Ehdr *ehdr;
-
-	/* Zero out the parsed elf structure. */
-	memset(pelf, 0, sizeof(*pelf));
-
-	if (!iself(buffer_get(pinput))) {
-		DEBUG("The stage file is not in ELF format!\n");
-		return -1;
-	}
-
-	buffer_clone(&input, pinput);
-	ehdr = &pelf->ehdr;
-	elf_eident(&input, ehdr);
-	bit64 = ehdr->e_ident[EI_CLASS] == ELFCLASS64;
-	/* Assume LE unless we are sure otherwise.
-	 * We're not going to take on the task of
-	 * fully validating the ELF file. That way
-	 * lies madness.
-	 */
-	if (ehdr->e_ident[EI_DATA] == ELFDATA2MSB)
-		xdr = &xdr_be;
-
-	elf_ehdr(&input, ehdr, xdr, bit64);
-
-	/* Relocation processing requires section header parsing. */
-	if (flags & ELF_PARSE_RELOC)
-		flags |= ELF_PARSE_SHDR;
-
-	/* String table processing requires section header parsing. */
-	if (flags & ELF_PARSE_STRTAB)
-		flags |= ELF_PARSE_SHDR;
-
-	/* Symbole table processing requires section header parsing. */
-	if (flags & ELF_PARSE_SYMTAB)
-		flags |= ELF_PARSE_SHDR;
-
-	if ((flags & ELF_PARSE_PHDR) && phdr_read(pinput, pelf, xdr, bit64))
-		goto fail;
-
-	if ((flags & ELF_PARSE_SHDR) && shdr_read(pinput, pelf, xdr, bit64))
-		goto fail;
-
-	if ((flags & ELF_PARSE_RELOC) && reloc_read(pinput, pelf, xdr, bit64))
-		goto fail;
-
-	if ((flags & ELF_PARSE_STRTAB) && strtab_read(pinput, pelf))
-		goto fail;
-
-	if ((flags & ELF_PARSE_SYMTAB) && symtab_read(pinput, pelf, xdr, bit64))
-		goto fail;
-
-	return 0;
-
-fail:
-	parsed_elf_destroy(pelf);
-	return -1;
-}
-
-void parsed_elf_destroy(struct parsed_elf *pelf)
-{
-	Elf64_Half i;
-
-	free(pelf->phdr);
-	free(pelf->shdr);
-	if (pelf->relocs != NULL) {
-		for (i = 0; i < pelf->ehdr.e_shnum; i++)
-			free(pelf->relocs[i]);
-	}
-	free(pelf->relocs);
-
-	if (pelf->strtabs != NULL) {
-		for (i = 0; i < pelf->ehdr.e_shnum; i++)
-			free(pelf->strtabs[i]);
-	}
-	free(pelf->strtabs);
-	free(pelf->syms);
-}
-
-/* Get the headers from the buffer.
- * Return -1 in the event of an error.
- * The section headers are optional; if NULL
- * is passed in for pshdr they won't be parsed.
- * We don't (yet) make payload parsing optional
- * because we've never seen a use case.
- */
-int
-elf_headers(const struct buffer *pinput,
-	    Elf64_Ehdr *ehdr,
-	    Elf64_Phdr **pphdr,
-	    Elf64_Shdr **pshdr)
-{
-	struct parsed_elf pelf;
-	int flags;
-
-	flags = ELF_PARSE_PHDR;
-
-	if (pshdr != NULL)
-		flags |= ELF_PARSE_SHDR;
-
-	if (parse_elf(pinput, &pelf, flags))
-		return -1;
-
-	/* Copy out the parsed elf header. */
-	memcpy(ehdr, &pelf.ehdr, sizeof(*ehdr));
-
-	*pphdr = calloc(ehdr->e_phnum, sizeof(Elf64_Phdr));
-	memcpy(*pphdr, pelf.phdr, ehdr->e_phnum * sizeof(Elf64_Phdr));
-
-	if (pshdr != NULL) {
-		*pshdr = calloc(ehdr->e_shnum, sizeof(Elf64_Shdr));
-		memcpy(*pshdr, pelf.shdr, ehdr->e_shnum * sizeof(Elf64_Shdr));
-	}
-
-	parsed_elf_destroy(&pelf);
-
-	return 0;
-}
-
-/* ELF Writing  Support
- *
- * The ELF file is written according to the following layout:
- * +------------------+
- * |    ELF Header    |
- * +------------------+
- * | Section  Headers |
- * +------------------+
- * | Program  Headers |
- * +------------------+
- * |   String table   |
- * +------------------+ <- 4KiB Aligned
- * |     Code/Data    |
- * +------------------+
- */
-
-void elf_init_eheader(Elf64_Ehdr *ehdr, int machine, int nbits, int endian)
-{
-	memset(ehdr, 0, sizeof(*ehdr));
-	ehdr->e_ident[EI_MAG0] = ELFMAG0;
-	ehdr->e_ident[EI_MAG1] = ELFMAG1;
-	ehdr->e_ident[EI_MAG2] = ELFMAG2;
-	ehdr->e_ident[EI_MAG3] = ELFMAG3;
-	ehdr->e_ident[EI_CLASS] = nbits;
-	ehdr->e_ident[EI_DATA] = endian;
-	ehdr->e_ident[EI_VERSION] = EV_CURRENT;
-	ehdr->e_type = ET_EXEC;
-	ehdr->e_machine = machine;
-	ehdr->e_version = EV_CURRENT;
-	if (nbits == ELFCLASS64) {
-		ehdr->e_ehsize = sizeof(Elf64_Ehdr);
-		ehdr->e_phentsize = sizeof(Elf64_Phdr);
-		ehdr->e_shentsize = sizeof(Elf64_Shdr);
-	} else {
-		ehdr->e_ehsize = sizeof(Elf32_Ehdr);
-		ehdr->e_phentsize = sizeof(Elf32_Phdr);
-		ehdr->e_shentsize = sizeof(Elf32_Shdr);
-	}
-}
-
-/* Arbitrary maximum number of sections. */
-#define MAX_SECTIONS 16
-struct elf_writer_section {
-	Elf64_Shdr shdr;
-	struct buffer content;
-	const char *name;
-};
-
-struct elf_writer_string_table {
-	size_t next_offset;
-	size_t max_size;
-	char *buffer;
-};
-
-struct elf_writer_sym_table {
-	size_t max_entries;
-	size_t num_entries;
-	Elf64_Sym *syms;
-};
-
-#define MAX_REL_NAME 32
-struct elf_writer_rel {
-	size_t num_entries;
-	size_t max_entries;
-	Elf64_Rel *rels;
-	struct elf_writer_section *sec;
-	char name[MAX_REL_NAME];
-};
-
-struct elf_writer
-{
-	Elf64_Ehdr ehdr;
-	struct xdr *xdr;
-	size_t num_secs;
-	struct elf_writer_section sections[MAX_SECTIONS];
-	struct elf_writer_rel rel_sections[MAX_SECTIONS];
-	Elf64_Phdr *phdrs;
-	struct elf_writer_section *shstrtab_sec;
-	struct elf_writer_section *strtab_sec;
-	struct elf_writer_section *symtab_sec;
-	struct elf_writer_string_table strtab;
-	struct elf_writer_sym_table symtab;
-	int bit64;
-};
-
-static size_t section_index(struct elf_writer *ew,
-					struct elf_writer_section *sec)
-{
-	return sec - &ew->sections[0];
-}
-
-static struct elf_writer_section *last_section(struct elf_writer *ew)
-{
-	return &ew->sections[ew->num_secs - 1];
-}
-
-static void strtab_init(struct elf_writer *ew, size_t size)
-{
-	struct buffer b;
-	Elf64_Shdr shdr;
-
-	/* Start adding strings after the initial NUL entry. */
-	ew->strtab.next_offset = 1;
-	ew->strtab.max_size = size;
-	ew->strtab.buffer = calloc(1, ew->strtab.max_size);
-
-	buffer_init(&b, NULL, ew->strtab.buffer, ew->strtab.max_size);
-	memset(&shdr, 0, sizeof(shdr));
-	shdr.sh_type = SHT_STRTAB;
-	shdr.sh_addralign = 1;
-	shdr.sh_size = ew->strtab.max_size;
-	elf_writer_add_section(ew, &shdr, &b, ".strtab");
-	ew->strtab_sec = last_section(ew);
-}
-
-static void symtab_init(struct elf_writer *ew, size_t max_entries)
-{
-	struct buffer b;
-	Elf64_Shdr shdr;
-
-	memset(&shdr, 0, sizeof(shdr));
-	shdr.sh_type = SHT_SYMTAB;
-
-	if (ew->bit64) {
-		shdr.sh_entsize = sizeof(Elf64_Sym);
-		shdr.sh_addralign = sizeof(Elf64_Addr);
-	} else {
-		shdr.sh_entsize = sizeof(Elf32_Sym);
-		shdr.sh_addralign = sizeof(Elf32_Addr);
-	}
-
-	shdr.sh_size = shdr.sh_entsize * max_entries;
-
-	ew->symtab.syms = calloc(max_entries, sizeof(Elf64_Sym));
-	ew->symtab.num_entries = 1;
-	ew->symtab.max_entries = max_entries;
-
-	buffer_init(&b, NULL, ew->symtab.syms, shdr.sh_size);
-
-	elf_writer_add_section(ew, &shdr, &b, ".symtab");
-	ew->symtab_sec = last_section(ew);
-}
-
-struct elf_writer *elf_writer_init(const Elf64_Ehdr *ehdr)
-{
-	struct elf_writer *ew;
-	Elf64_Shdr shdr;
-	struct buffer empty_buffer;
-
-	if (!iself(ehdr))
-		return NULL;
-
-	ew = calloc(1, sizeof(*ew));
-
-	memcpy(&ew->ehdr, ehdr, sizeof(ew->ehdr));
-
-	ew->bit64 = ew->ehdr.e_ident[EI_CLASS] == ELFCLASS64;
-
-	/* Set the endinan ops. */
-	if (ew->ehdr.e_ident[EI_DATA] == ELFDATA2MSB)
-		ew->xdr = &xdr_be;
-	else
-		ew->xdr = &xdr_le;
-
-	/* Reset count and offsets */
-	ew->ehdr.e_phoff = 0;
-	ew->ehdr.e_shoff = 0;
-	ew->ehdr.e_shnum = 0;
-	ew->ehdr.e_phnum = 0;
-
-	memset(&empty_buffer, 0, sizeof(empty_buffer));
-	memset(&shdr, 0, sizeof(shdr));
-
-	/* Add SHT_NULL section header. */
-	shdr.sh_type = SHT_NULL;
-	elf_writer_add_section(ew, &shdr, &empty_buffer, NULL);
-
-	/* Add section header string table and maintain reference to it.  */
-	shdr.sh_type = SHT_STRTAB;
-	elf_writer_add_section(ew, &shdr, &empty_buffer, ".shstrtab");
-	ew->shstrtab_sec = last_section(ew);
-	ew->ehdr.e_shstrndx = section_index(ew, ew->shstrtab_sec);
-
-	/* Add a small string table and symbol table. */
-	strtab_init(ew, 4096);
-	symtab_init(ew, 100);
-
-	return ew;
-}
-
-/*
- * Clean up any internal state represented by ew. Aftewards the elf_writer
- * is invalid.
- * It is safe to call elf_writer_destroy with ew as NULL. It returns without
- * performing any action.
- */
-void elf_writer_destroy(struct elf_writer *ew)
-{
-	int i;
-	if (ew == NULL)
+	if (close(fd) != -1)
 		return;
-	if (ew->phdrs != NULL)
-		free(ew->phdrs);
-	free(ew->strtab.buffer);
-	free(ew->symtab.syms);
-	for (i = 0; i < MAX_SECTIONS; i++)
-		free(ew->rel_sections[i].rels);
-	free(ew);
+	write(STDERR_FILENO, "Error: Can't close fd\n", 22);
+	exit(98);
 }
 
-/*
- * Add a section to the ELF file. Section type, flags, and memsize are
- * maintained from the passed in Elf64_Shdr. The buffer represents the
- * content of the section while the name is the name of section itself.
- * Returns < 0 on error, 0 on success.
+/**
+ * _read - read from a file and print an error message upon failure
+ * @fd: the file descriptor to read from
+ * @buf: the buffer to write to
+ * @count: the number of bytes to read
  */
-int elf_writer_add_section(struct elf_writer *ew, const Elf64_Shdr *shdr,
-                           struct buffer *contents, const char *name)
+void _read(int fd, char *buf, size_t count)
 {
-	struct elf_writer_section *newsh;
-
-	if (ew->num_secs == MAX_SECTIONS)
-		return -1;
-
-	newsh = &ew->sections[ew->num_secs];
-	ew->num_secs++;
-
-	memcpy(&newsh->shdr, shdr, sizeof(newsh->shdr));
-	newsh->shdr.sh_offset = 0;
-
-	newsh->name = name;
-	if (contents != NULL)
-		buffer_clone(&newsh->content, contents);
-
-	return 0;
+	if (read(fd, buf, count) != -1)
+		return;
+	write(STDERR_FILENO, "Error: Can't read from file\n", 28);
+	_close(fd);
+	exit(98);
 }
 
-static void ehdr_write(struct elf_writer *ew, struct buffer *m)
+/**
+ * elf_magic - print ELF magic
+ * @buffer: the ELF header
+ */
+void elf_magic(const unsigned char *buffer)
 {
-	int i;
+	unsigned int i;
 
-	for (i = 0; i < EI_NIDENT; i++)
-		ew->xdr->put8(m, ew->ehdr.e_ident[i]);
-	ew->xdr->put16(m, ew->ehdr.e_type);
-	ew->xdr->put16(m, ew->ehdr.e_machine);
-	ew->xdr->put32(m, ew->ehdr.e_version);
-	if (ew->bit64) {
-		ew->xdr->put64(m, ew->ehdr.e_entry);
-		ew->xdr->put64(m, ew->ehdr.e_phoff);
-		ew->xdr->put64(m, ew->ehdr.e_shoff);
-	} else {
-		ew->xdr->put32(m, ew->ehdr.e_entry);
-		ew->xdr->put32(m, ew->ehdr.e_phoff);
-		ew->xdr->put32(m, ew->ehdr.e_shoff);
+	if (_strncmp((const char *) buffer, ELFMAG, 4))
+	{
+		write(STDERR_FILENO, "Error: Not an ELF file\n", 23);
+		exit(98);
 	}
-	ew->xdr->put32(m, ew->ehdr.e_flags);
-	ew->xdr->put16(m, ew->ehdr.e_ehsize);
-	ew->xdr->put16(m, ew->ehdr.e_phentsize);
-	ew->xdr->put16(m, ew->ehdr.e_phnum);
-	ew->xdr->put16(m, ew->ehdr.e_shentsize);
-	ew->xdr->put16(m, ew->ehdr.e_shnum);
-	ew->xdr->put16(m, ew->ehdr.e_shstrndx);
+
+	printf("ELF Header:\n  Magic:   ");
+
+	for (i = 0; i < 16; ++i)
+		printf("%02x%c", buffer[i], i < 15 ? ' ' : '\n');
 }
 
-static void shdr_write(struct elf_writer *ew, size_t n, struct buffer *m)
+/**
+ * elf_class - print ELF class
+ * @buffer: the ELF header
+ *
+ * Return: bit mode (32 or 64)
+ */
+size_t elf_class(const unsigned char *buffer)
 {
-	struct xdr *xdr = ew->xdr;
-	int bit64 = ew->bit64;
-	struct elf_writer_section *sec = &ew->sections[n];
-	Elf64_Shdr *shdr = &sec->shdr;
+	printf("  %-34s ", "Class:");
 
-	xdr->put32(m, shdr->sh_name);
-	xdr->put32(m, shdr->sh_type);
-	if (bit64) {
-		xdr->put64(m, shdr->sh_flags);
-		xdr->put64(m, shdr->sh_addr);
-		xdr->put64(m, shdr->sh_offset);
-		xdr->put64(m, shdr->sh_size);
-		xdr->put32(m, shdr->sh_link);
-		xdr->put32(m, shdr->sh_info);
-		xdr->put64(m, shdr->sh_addralign);
-		xdr->put64(m, shdr->sh_entsize);
-	} else {
-		xdr->put32(m, shdr->sh_flags);
-		xdr->put32(m, shdr->sh_addr);
-		xdr->put32(m, shdr->sh_offset);
-		xdr->put32(m, shdr->sh_size);
-		xdr->put32(m, shdr->sh_link);
-		xdr->put32(m, shdr->sh_info);
-		xdr->put32(m, shdr->sh_addralign);
-		xdr->put32(m, shdr->sh_entsize);
+	if (buffer[EI_CLASS] == ELFCLASS64)
+	{
+		printf("ELF64\n");
+		return (64);
 	}
+	if (buffer[EI_CLASS] == ELFCLASS32)
+	{
+		printf("ELF32\n");
+		return (32);
+	}
+	printf("<unknown: %x>\n", buffer[EI_CLASS]);
+	return (32);
 }
 
-static void
-phdr_write(struct elf_writer *ew, struct buffer *m, Elf64_Phdr *phdr)
+/**
+ * elf_data - print ELF data
+ * @buffer: the ELF header
+ *
+ * Return: 1 if big endian, otherwise 0
+ */
+int elf_data(const unsigned char *buffer)
 {
-	if (ew->bit64) {
-		ew->xdr->put32(m, phdr->p_type);
-		ew->xdr->put32(m, phdr->p_flags);
-		ew->xdr->put64(m, phdr->p_offset);
-		ew->xdr->put64(m, phdr->p_vaddr);
-		ew->xdr->put64(m, phdr->p_paddr);
-		ew->xdr->put64(m, phdr->p_filesz);
-		ew->xdr->put64(m, phdr->p_memsz);
-		ew->xdr->put64(m, phdr->p_align);
-	} else {
-		ew->xdr->put32(m, phdr->p_type);
-		ew->xdr->put32(m, phdr->p_offset);
-		ew->xdr->put32(m, phdr->p_vaddr);
-		ew->xdr->put32(m, phdr->p_paddr);
-		ew->xdr->put32(m, phdr->p_filesz);
-		ew->xdr->put32(m, phdr->p_memsz);
-		ew->xdr->put32(m, phdr->p_flags);
-		ew->xdr->put32(m, phdr->p_align);
-	}
+	printf("  %-34s ", "Data:");
 
+	if (buffer[EI_DATA] == ELFDATA2MSB)
+	{
+		printf("2's complement, big endian\n");
+		return (1);
+	}
+	if (buffer[EI_DATA] == ELFDATA2LSB)
+	{
+		printf("2's complement, little endian\n");
+		return (0);
+	}
+	printf("Invalid data encoding\n");
+	return (0);
 }
 
-static int section_consecutive(struct elf_writer *ew, Elf64_Half secidx)
+/**
+ * elf_version - print ELF version
+ * @buffer: the ELF header
+ */
+void elf_version(const unsigned char *buffer)
 {
-	Elf64_Half i;
-	struct elf_writer_section *prev_alloc = NULL;
+	printf("  %-34s %u", "Version:", buffer[EI_VERSION]);
 
-	if (secidx == 0)
-		return 0;
-
-	for (i = 0; i < secidx; i++) {
-		if (ew->sections[i].shdr.sh_flags & SHF_ALLOC)
-			prev_alloc = &ew->sections[i];
-	}
-
-	if (prev_alloc == NULL)
-		return 0;
-
-	if (prev_alloc->shdr.sh_addr + prev_alloc->shdr.sh_size ==
-	    ew->sections[secidx].shdr.sh_addr)
-		return 1;
-
-	return 0;
+	if (buffer[EI_VERSION] == EV_CURRENT)
+		printf(" (current)\n");
+	else
+		printf("\n");
 }
 
-static void write_phdrs(struct elf_writer *ew, struct buffer *phdrs)
+/**
+ * elf_osabi - print ELF OS/ABI
+ * @buffer: the ELF header
+ */
+void elf_osabi(const unsigned char *buffer)
 {
-	Elf64_Half i;
-	Elf64_Phdr phdr;
-	size_t num_written = 0;
-	size_t num_needs_write = 0;
+	const char *os_table[19] = {
+		"UNIX - System V",
+		"UNIX - HP-UX",
+		"UNIX - NetBSD",
+		"UNIX - GNU",
+		"<unknown: 4>",
+		"<unknown: 5>",
+		"UNIX - Solaris",
+		"UNIX - AIX",
+		"UNIX - IRIX",
+		"UNIX - FreeBSD",
+		"UNIX - Tru64",
+		"Novell - Modesto",
+		"UNIX - OpenBSD",
+		"VMS - OpenVMS",
+		"HP - Non-Stop Kernel",
+		"AROS",
+		"FenixOS",
+		"Nuxi CloudABI",
+		"Stratus Technologies OpenVOS"
+	};
 
-	for (i = 0; i < ew->num_secs; i++) {
-		struct elf_writer_section *sec = &ew->sections[i];
+	printf("  %-34s ", "OS/ABI:");
 
-		if (!(sec->shdr.sh_flags & SHF_ALLOC))
-			continue;
+	if (buffer[EI_OSABI] < 19)
+		printf("%s\n", os_table[(unsigned int) buffer[EI_OSABI]]);
+	else
+		printf("<unknown: %x>\n", buffer[EI_OSABI]);
+}
 
-		if (!section_consecutive(ew, i)) {
-			/* Write out previously set phdr. */
-			if (num_needs_write != num_written) {
-				phdr_write(ew, phdrs, &phdr);
-				num_written++;
-			}
-			phdr.p_type = PT_LOAD;
-			phdr.p_offset = sec->shdr.sh_offset;
-			phdr.p_vaddr = sec->shdr.sh_addr;
-			phdr.p_paddr = sec->shdr.sh_addr;
-			phdr.p_filesz = buffer_size(&sec->content);
-			phdr.p_memsz = sec->shdr.sh_size;
-			phdr.p_flags = 0;
-			if (sec->shdr.sh_flags & SHF_EXECINSTR)
-				phdr.p_flags |= PF_X | PF_R;
-			if (sec->shdr.sh_flags & SHF_WRITE)
-				phdr.p_flags |= PF_W;
-			phdr.p_align = sec->shdr.sh_addralign;
-			num_needs_write++;
+/**
+ * elf_abivers - print ELF ABI version
+ * @buffer: the ELF header
+ */
+void elf_abivers(const unsigned char *buffer)
+{
+	printf("  %-34s %u\n", "ABI Version:", buffer[EI_ABIVERSION]);
+}
 
-		} else {
-			/* Accumulate file size and memsize. The assumption
-			 * is that each section is either NOBITS or full
-			 * (sh_size == file size). This is standard in that
-			 * an ELF section doesn't have a file size component. */
-			if (sec->shdr.sh_flags & SHF_EXECINSTR)
-				phdr.p_flags |= PF_X | PF_R;
-			if (sec->shdr.sh_flags & SHF_WRITE)
-				phdr.p_flags |= PF_W;
-			phdr.p_filesz += buffer_size(&sec->content);
-			phdr.p_memsz += sec->shdr.sh_size;
-		}
+/**
+ * elf_type - print ELF type
+ * @buffer: the ELF header
+ * @big_endian: endianness (big endian if non-zero)
+ */
+void elf_type(const unsigned char *buffer, int big_endian)
+{
+	char *type_table[5] = {
+		"NONE (No file type)",
+		"REL (Relocatable file)",
+		"EXEC (Executable file)",
+		"DYN (Shared object file)",
+		"CORE (Core file)"
+	};
+	unsigned int type;
+
+	printf("  %-34s ", "Type:");
+
+	if (big_endian)
+		type = 0x100 * buffer[16] + buffer[17];
+	else
+		type = 0x100 * buffer[17] + buffer[16];
+
+	if (type < 5)
+		printf("%s\n", type_table[type]);
+	else if (type >= ET_LOOS && type <= ET_HIOS)
+		printf("OS Specific: (%4x)\n", type);
+	else if (type >= ET_LOPROC && type <= ET_HIPROC)
+		printf("Processor Specific: (%4x)\n", type);
+	else
+		printf("<unknown: %x>\n", type);
+}
+
+/**
+ * elf_entry - print entry point address
+ * @buffer: string containing the entry point address
+ * @bit_mode: bit mode (32 or 64)
+ * @big_endian: endianness (big endian if non-zero)
+ */
+void elf_entry(const unsigned char *buffer, size_t bit_mode, int big_endian)
+{
+	int address_size = bit_mode / 8;
+
+	printf("  %-34s 0x", "Entry point address:");
+
+	if (big_endian)
+	{
+		while (address_size && !*(buffer))
+			--address_size, ++buffer;
+
+		printf("%x", *buffer & 0xff);
+
+		while (--address_size > 0)
+			printf("%02x", *(++buffer) & 0xff);
+	}
+	else
+	{
+		buffer += address_size;
+
+		while (address_size && !*(--buffer))
+			--address_size;
+
+		printf("%x", *buffer & 0xff);
+
+		while (--address_size > 0)
+			printf("%02x", *(--buffer) & 0xff);
 	}
 
-	/* Write out the last phdr. */
-	if (num_needs_write != num_written) {
+	printf("\n");
+}
 
-	  
+/**
+ * main - copy a file's contents to another file
+ * @argc: the argument count
+ * @argv: the argument values
+ *
+ * Return: Always 0
+ */
+int main(int argc, const char *argv[])
+{
+	unsigned char buffer[18];
+	unsigned int bit_mode;
+	int big_endian;
+	int fd;
+
+	if (argc != 2)
+	{
+		write(STDERR_FILENO, "Usage: elf_header elf_filename\n", 31);
+		exit(98);
+	}
+
+	fd = open(argv[1], O_RDONLY);
+	if (fd == -1)
+	{
+		write(STDERR_FILENO, "Error: Can't read from file\n", 28);
+		exit(98);
+	}
+
+	_read(fd, (char *) buffer, 18);
+
+	elf_magic(buffer);
+	bit_mode = elf_class(buffer);
+	big_endian = elf_data(buffer);
+	elf_version(buffer);
+	elf_osabi(buffer);
+	elf_abivers(buffer);
+	elf_type(buffer, big_endian);
+
+	lseek(fd, 24, SEEK_SET);
+	_read(fd, (char *) buffer, bit_mode / 8);
+
+	elf_entry(buffer, bit_mode, big_endian);
+
+	_close(fd);
+
+	return (0);
+}
